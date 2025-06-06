@@ -8,6 +8,7 @@ from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache, SlidingWindowCache, StaticCache
@@ -48,6 +49,8 @@ class EMInfLogitsProcessor(LogitsProcessor):
     Logits processor for EM-INF (Entropy Minimization at Inference).
 
     Args:
+        model (`torch.nn.Module`):
+            The model to which the EM-INF optimization is applied.
         delta (`float`, *optional*, defaults to 0.2):
             The target entropy threshold. The optimization will try to reduce the entropy of the distribution
             until it is less than or equal to this value.
@@ -57,32 +60,44 @@ class EMInfLogitsProcessor(LogitsProcessor):
             The number of optimization steps to perform.
     """
 
-    def __init__(self, delta: float = 0.2, lr: float = 1e-3, steps: int = 10):
-        super().__init__()
+    def __init__(self, model, delta: float = 0.2, lr: float = 1e-3, steps: int = 10):
+        self.model = model
         self.delta = delta
         self.lr = lr
         self.steps = steps
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-        logits = scores.clone().detach().requires_grad_(True)
-        optimizer = torch.optim.Adam([logits], lr=self.lr)
+        with torch.enable_grad():
+            # Manually enable training mode for the lm_head to ensure gradients are computed
+            # for the EM-INF optimization step, then switch it back to eval.
+            lm_head = self.model.get_output_embeddings()
+            original_mode = lm_head.training
+            lm_head.train()
 
-        for _ in range(self.steps):
-            optimizer.zero_grad()
-
-            probs = torch.nn.functional.softmax(logits, dim=-1)
-            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-            entropy = -torch.sum(probs * log_probs, dim=-1)
-
-            # Minimize the entropy until it is less than or equal to delta.
-            # The loss is max(entropy, delta), so the gradient is non-zero only when entropy > delta.
-            loss = torch.max(entropy, torch.tensor(self.delta, device=logits.device, dtype=logits.dtype))
-
-            # We want to minimize the average loss over the batch
+            # Get input embeddings, which are float tensors and can have gradients.
+            input_embeds = self.model.get_input_embeddings()(input_ids)
+            clone_embeds = input_embeds.clone().detach().requires_grad_(True)
+            
+            for _ in range(self.steps):
+                new_logits = self.model(inputs_embeds=clone_embeds).logits[:, -1, :]
+                
+                # Constraint: new_logits should be close to scores
+                constraint = torch.mean((new_logits - scores)**2)
+                if constraint > self.delta:
+                    break
+            
+            loss = F.kl_div(F.log_softmax(new_logits, dim=-1), F.softmax(scores.detach(), dim=-1), log_target=True, reduction='none')
             loss.mean().backward()
-            optimizer.step()
-
-        return logits.detach()
+            
+            grad = clone_embeds.grad
+            # Project the gradient from the embedding space to the vocabulary space.
+            grad_projection = F.linear(grad[:, -1, :], lm_head.weight)
+            scores = scores - self.lr * grad_projection
+            
+            # Restore the original mode of the lm_head
+            lm_head.train(original_mode)
+        
+        return scores
 
 
 class Qwen2MLP(nn.Module):

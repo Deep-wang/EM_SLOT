@@ -4,7 +4,7 @@ from transformers import AutoTokenizer
 
 import torch
 import re
-from datasets import load_dataset
+from datasets import load_dataset, DatasetDict
 import random
 import argparse
 
@@ -45,14 +45,22 @@ def reward_format(item, answer):
     result_score = 1.25 if match_obj else -1.0
     return result_score
 
-def evaluate_model(model, tokenizer, eval_samples=None, split="test", generation_params=None, seed=42, log_file="evaluation_log.txt"):
+def evaluate_model(model, tokenizer, eval_samples=None, split="test", generation_params=None, seed=42, log_file="evaluation_log.txt", dataset_path=None):
     """Evaluates the model's performance on the GSM8K dataset."""
     print("Starting model evaluation...")
     model.eval()    
     random.seed(seed)
     
     # Load the evaluation dataset
-    eval_dataset = load_dataset("openai/gsm8k", "main", split=split)
+    if dataset_path:
+        print(f"Loading dataset from local path: {dataset_path}")
+        # Use the more robust DatasetDict.load_from_disk to load a saved dataset
+        dataset_dict = DatasetDict.load_from_disk(dataset_path)
+        eval_dataset = dataset_dict[split]
+    else:
+        print("Loading dataset from Hugging Face Hub: openai/gsm8k")
+        eval_dataset = load_dataset("openai/gsm8k", "main", split=split)
+
     eval_QAs = [{'Q':x, 'A':y.split('####')[-1].strip()} 
                 for x,y in zip(eval_dataset['question'], eval_dataset['answer'])]
     
@@ -87,10 +95,14 @@ The reasoning process and answer are enclosed within <think> </think> and<answer
         inputs = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False).to(model.device)
         
         os.environ["prompt_only"] = "True" # Ensure this env var is handled correctly if needed elsewhere
-        outputs = model.generate(
-            **inputs,
-            **generation_params,
-        )
+        
+        # EM-INF requires gradients, so we must enable them for the generation call,
+        # even during evaluation.
+        with torch.enable_grad():
+            outputs = model.generate(
+                **inputs,
+                **generation_params,
+            )
         
         completion = tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
         
@@ -139,6 +151,7 @@ The reasoning process and answer are enclosed within <think> </think> and<answer
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, default="/ssdwork/huyang/r1/simple_GRPO_debug/slot_gsm8k/models/Qwen2.5-7B", help="Path to the model")
+    parser.add_argument("--dataset_path", type=str, default=None, help="Path to the local dataset directory")
     parser.add_argument("--eval_samples", type=int, default=None, help="Number of samples to evaluate, None for full evaluation")
     parser.add_argument("--split", type=str, default="test", choices=["test", "train"], help="Dataset split to evaluate on")
     parser.add_argument("--do_sample", action="store_true", help="Whether to use sampling for generation")
@@ -172,6 +185,7 @@ def main():
         if not args.do_sample:
             print("Warning: EM-INF is most effective with sampling, but --do_sample is not set.")
         em_inf_processor = EMInfLogitsProcessor(
+            model=model,
             delta=args.em_inf_delta,
             lr=args.em_inf_lr,
             steps=args.em_inf_steps
@@ -210,7 +224,8 @@ def main():
         split=args.split, 
         generation_params=generation_params, 
         seed=args.seed,
-        log_file=log_file # Pass log file path
+        log_file=log_file, # Pass log file path
+        dataset_path=args.dataset_path
     )
     
     # Log final results (already done inside evaluate_model, but can add a summary here if needed)
